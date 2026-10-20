@@ -1,4 +1,4 @@
-import io, math, os, shutil, subprocess, tempfile, zipfile
+import io, math, os, tempfile
 from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
@@ -25,7 +25,7 @@ label{display:block;font-weight:bold;margin:16px 0 7px}input[type=file]{width:10
 .muted{color:#555}.error{background:#fff1f0;padding:12px;border-radius:8px}
 </style></head><body>
 <h1>QC Comparative Dissolution Report Generator</h1>
-<p class="muted">Upload your completed Excel workbook to create a Word report and PDF using your supplied report layout.</p>
+<p class="muted">Upload your completed Excel workbook to create an editable Word report using your supplied report layout.</p>
 <div class="panel"><h2>1. Download Excel input template</h2>
 <p>Includes Product, pH 1.2, pH 4.5 and pH 6.8 sheets. Example values are from the uploaded report; replace them for each new study.</p>
 <a class="button" href="/download-input">Download Excel template</a></div>
@@ -33,7 +33,7 @@ label{display:block;font-weight:bold;margin:16px 0 7px}input[type=file]{width:10
 {% if error %}<p class="error"><strong>Could not generate:</strong> {{error}}</p>{% endif %}
 <form method="post" enctype="multipart/form-data">
 <label>Completed Excel workbook (.xlsx)</label><input name="input_file" type="file" accept=".xlsx" required>
-<p class="muted">Output is a ZIP file containing the editable Word report and PDF.</p><button type="submit">Generate Word + PDF</button>
+<p class="muted">Output: an editable Word report (.docx).</p><button type="submit">Generate Word Report</button>
 </form></div>
 <p class="muted">Review calculations and output under your approved QC procedure before official use.</p>
 </body></html>
@@ -186,18 +186,6 @@ def generate(xlsx_path, work):
     doc.save(out_docx)
     return out_docx
 
-def to_pdf(docx_path, work):
-    office = shutil.which("libreoffice") or shutil.which("soffice")
-    if not office:
-        raise RuntimeError("LibreOffice is unavailable. Check Render's apt.txt setup.")
-    profile = Path(work) / "lo_profile"
-    result = subprocess.run([office, f"-env:UserInstallation=file://{profile}", "--headless",
-        "--convert-to", "pdf", "--outdir", work, docx_path], capture_output=True, text=True, timeout=120)
-    pdf = os.path.join(work, Path(docx_path).stem + ".pdf")
-    if not os.path.exists(pdf):
-        raise RuntimeError("PDF conversion failed: " + (result.stderr or result.stdout or "Unknown error"))
-    return pdf
-
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
@@ -206,17 +194,19 @@ def index():
     if not upload or not upload.filename.lower().endswith(".xlsx"):
         return render_template_string(HTML, error="Upload an .xlsx workbook from the supplied input template.")
     try:
-        with tempfile.TemporaryDirectory() as work:
-            xlsx = os.path.join(work, "input.xlsx")
-            upload.save(xlsx)
-            docx = generate(xlsx, work)
-            pdf = to_pdf(docx, work)
-            archive = os.path.join(work, "reports.zip")
-            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-                z.write(docx, "generated_report.docx")
-                z.write(pdf, "generated_report.pdf")
-            return send_file(io.BytesIO(Path(archive).read_bytes()), as_attachment=True,
-                download_name="generated_reports.zip", mimetype="application/zip")
+        # Use a persistent per-request working directory. Windows may temporarily lock
+        # generated DOCX/PNG files (for example, via antivirus scanning), so deleting
+        # a TemporaryDirectory immediately can raise WinError 32 even after reading the
+        # report bytes. Keeping this directory avoids the cleanup race.
+        work = tempfile.mkdtemp(prefix="qc_report_")
+        xlsx = os.path.join(work, "input.xlsx")
+        upload.save(xlsx)
+        docx = generate(xlsx, work)
+        with open(docx, "rb") as report_file:
+            report_bytes = report_file.read()
+        return send_file(io.BytesIO(report_bytes), as_attachment=True,
+            download_name="generated_report.docx",
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     except Exception as e:
         return render_template_string(HTML, error=str(e))
 
